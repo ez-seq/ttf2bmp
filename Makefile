@@ -70,7 +70,7 @@ build: build-lib build-cli build-tools
 build-cli:
 	@echo "  >  Building CLI ($(BINARY_NAME))..."
 	@mkdir -p $(OUTPUT_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME) ./main.go
+	$(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 
 build-lib:
 	@echo "  >  Verifying Library compilation..."
@@ -185,23 +185,23 @@ clean:
 
 build-linux:
 	@echo "  >  Building for Linux (AMD64)..."
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-linux ./main.go
+	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-linux .
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/verifier-linux $(TOOL_VERIFIER_SRC)
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/validator-linux $(TOOL_VALIDATOR_SRC)
 
 build-windows:
 	@echo "  >  Building for Windows (AMD64)..."
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-windows.exe ./main.go
+	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-windows.exe .
 	GOOS=windows GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/verifier-windows.exe $(TOOL_VERIFIER_SRC)
 	GOOS=windows GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/validator-windows.exe $(TOOL_VALIDATOR_SRC)
 
 build-mac:
 	@echo "  >  Building for MacOS (Intel)..."
-	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-darwin-amd64 ./main.go
+	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-darwin-amd64 .
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/verifier-darwin-amd64 $(TOOL_VERIFIER_SRC)
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) -o $(OUTPUT_DIR)/validator-darwin-amd64 $(TOOL_VALIDATOR_SRC)
 	@echo "  >  Building for MacOS (Apple Silicon)..."
-	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-darwin-arm64 ./main.go
+	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME)-darwin-arm64 .
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) -o $(OUTPUT_DIR)/verifier-darwin-arm64 $(TOOL_VERIFIER_SRC)
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) -o $(OUTPUT_DIR)/validator-darwin-arm64 $(TOOL_VALIDATOR_SRC)
 

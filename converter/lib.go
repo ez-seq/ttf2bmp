@@ -12,14 +12,60 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
-// Generate creates the Font files (image + fnt).
-// Now accepts 'hinting' ("none", "vertical", "full")
+// Options controls how a font is rendered and written.
+type Options struct {
+	// Format is "png" or "bmp" (image + fnt), or "c" (C source + header in the
+	// Microchip Graphics Library font format).
+	Format string
+	// Padding is the gap between glyphs in the atlas, in pixels.
+	Padding int
+	// Hinting is "none", "vertical" or "full".
+	Hinting string
+	// Stroke is 0 for filled glyphs; a positive width in pixels, which may be
+	// fractional, keeps only the band that far inside each glyph's edge (hollow
+	// glyphs). It changes the image only; the fnt is the same as for filled glyphs.
+	Stroke float64
+	// BPP is the colour depth, 1, 2, 4 or 8 bits per pixel: the number of
+	// antialiasing levels is 2^BPP, so 1 turns antialiasing off.
+	BPP int
+	// Threshold is the coverage, above 0 and at most 1, at which a pixel is on at
+	// 1 bpp. It is ignored at other depths.
+	Threshold float64
+	// Tight crops the line height to the ink of the requested characters: the cell
+	// runs from the highest drawn row to the lowest, instead of the face's ascent,
+	// descent and line gap. Rows are counted after stroking and reducing to BPP, so a
+	// row that is not drawn at the final depth is not kept. Widths are unchanged.
+	Tight bool
+}
+
+// Generate creates the Font files (image + fnt) with full 8-bit antialiasing.
+// It accepts 'hinting' ("none", "vertical", "full")
 // and 'stroke': 0 draws filled glyphs; a positive width in pixels, which may be
 // fractional, keeps only the band that far inside each glyph's edge (hollow glyphs).
 // The stroke changes the image only; the fnt is the same as for filled glyphs.
-func Generate(fontPath string, size int, chars string, outPrefix string, format string, padding int, hinting string, stroke float64) (err error) {
+func Generate(fontPath string, size int, chars string, outPrefix string, format string, padding int, hinting string, stroke float64) error {
+	return GenerateWithOptions(fontPath, size, chars, outPrefix, Options{
+		Format:    format,
+		Padding:   padding,
+		Hinting:   hinting,
+		Stroke:    stroke,
+		BPP:       8,
+		Threshold: DefaultThreshold,
+	})
+}
+
+// GenerateWithOptions creates the font files for one face and size: an image and an
+// fnt descriptor, or for Format "c" a C source and header for an embedded target.
+func GenerateWithOptions(fontPath string, size int, chars string, outPrefix string, opts Options) (err error) {
+	format, padding, hinting, stroke := opts.Format, opts.Padding, opts.Hinting, opts.Stroke
 	if stroke != 0 && !(stroke >= MinStroke) {
 		return fmt.Errorf("stroke %v: must be 0 (filled) or at least %v px", stroke, MinStroke)
+	}
+	if !ValidBPP(opts.BPP) {
+		return fmt.Errorf("bpp %d: must be 1, 2, 4 or 8", opts.BPP)
+	}
+	if opts.BPP == 1 && !ValidThreshold(opts.Threshold) {
+		return fmt.Errorf("threshold %v: must be above 0 and at most 1", opts.Threshold)
 	}
 
 	// 1. Read & Parse Font
@@ -62,6 +108,12 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 	metrics := face.Metrics()
 	ascent := metrics.Ascent.Ceil()
 	lineHeight := metrics.Height.Ceil()
+	if opts.Tight {
+		if top, bottom, ok := inkExtent(face, chars); ok {
+			ascent = -top
+			lineHeight = bottom - top
+		}
+	}
 
 	var totalWidth int
 	var validCharCount int
@@ -120,6 +172,37 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 		}
 	}
 
+	// 5c. Reduce the antialiasing to the target depth
+	if err := quantize(img, opts.BPP, opts.Threshold); err != nil {
+		return err
+	}
+
+	// 5d. Drop the blank rows above and below the ink, if asked
+	if opts.Tight {
+		var removed int
+		img, removed = trimRows(img)
+		ascent -= removed
+		lineHeight = img.Bounds().Dy()
+	}
+
+	if format == "c" {
+		glyphs := make(map[rune]cGlyph, len(charPositions))
+		for char, x := range charPositions {
+			_, advance, _ := face.GlyphBounds(char)
+			glyphs[char] = cGlyph{x: x, width: advance.Ceil()}
+		}
+		return writeCSource(outPrefix, img, cFont{
+			fontPath:  fontPath,
+			size:      size,
+			hinting:   hinting,
+			stroke:    stroke,
+			bpp:       opts.BPP,
+			threshold: opts.Threshold,
+			height:    lineHeight,
+			glyphs:    glyphs,
+		})
+	}
+
 	// 6. Save Image
 	ext := "." + format
 	if err := func() error {
@@ -163,7 +246,11 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 
 		fileName := filepath.Base(outPrefix) + ext
 
-		if _, err := fmt.Fprintf(fntFile, "info face=\"%s\" size=%d bold=0 italic=0 charset=\"\" unicode=0 stretchH=100 smooth=1 aa=1 padding=0,0,0,0 spacing=%d,1\n", filepath.Base(fontPath), size, padding); err != nil {
+		smooth := 1
+		if opts.BPP == 1 {
+			smooth = 0
+		}
+		if _, err := fmt.Fprintf(fntFile, "info face=\"%s\" size=%d bold=0 italic=0 charset=\"\" unicode=0 stretchH=100 smooth=%d aa=1 padding=0,0,0,0 spacing=%d,1\n", filepath.Base(fontPath), size, smooth, padding); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintf(fntFile, "common lineHeight=%d base=%d scaleW=%d scaleH=%d pages=1 packed=0\n", lineHeight, ascent, totalWidth, lineHeight); err != nil {
@@ -195,4 +282,55 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 	}
 
 	return nil
+}
+
+// inkExtent returns the whole-pixel rows, relative to the baseline (negative above it),
+// that the ink of chars spans: from top inclusive to bottom exclusive. ok is false when
+// none of chars has any ink, as for a string of spaces.
+func inkExtent(face font.Face, chars string) (top, bottom int, ok bool) {
+	for _, char := range chars {
+		ink, _, found := face.GlyphBounds(char)
+		if !found || ink.Empty() {
+			continue
+		}
+		t, b := ink.Min.Y.Floor(), ink.Max.Y.Ceil()
+		if !ok || t < top {
+			top = t
+		}
+		if !ok || b > bottom {
+			bottom = b
+		}
+		ok = true
+	}
+	return top, bottom, ok
+}
+
+// trimRows returns img without the fully transparent rows at its top and bottom, as a
+// new image with its origin at (0, 0), and how many rows it removed from the top. An
+// image with no ink at all is returned as it is.
+func trimRows(img *image.RGBA) (*image.RGBA, int) {
+	b := img.Bounds()
+	blank := func(y int) bool {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if img.Pix[img.PixOffset(x, y)+3] != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	top, bottom := b.Min.Y, b.Max.Y
+	for top < bottom && blank(top) {
+		top++
+	}
+	for bottom > top && blank(bottom-1) {
+		bottom--
+	}
+	if top == bottom {
+		return img, 0
+	}
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx(), bottom-top))
+	for y := top; y < bottom; y++ {
+		copy(out.Pix[out.PixOffset(0, y-top):], img.Pix[img.PixOffset(b.Min.X, y):img.PixOffset(b.Max.X, y)])
+	}
+	return out, top - b.Min.Y
 }

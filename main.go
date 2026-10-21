@@ -21,20 +21,26 @@ type Config struct {
 	FontPattern string
 	Sizes       []int
 	Chars       string
+	Text        string
 	OutputDir   string
 	Format      string
 	Padding     int
 	Hinting     string // New field
 	Stroke      float64
+	BPP         int
+	Threshold   float64
+	Tight       bool
+	Name        string
 }
 
 var logBuffer []string
 
 func main() {
-	var fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, hintingFlag string
-	var paddingFlag int
-	var strokeFlag float64
-	var showVersion bool
+	var fontsFlag, familyFlag, sizesFlag, charsFlag, textFlag, outDir, typeFlag, hintingFlag string
+	var paddingFlag, bppFlag int
+	var strokeFlag, thresholdFlag float64
+	var showVersion, tightFlag bool
+	var nameFlag string
 
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s (%s):\n", "ttf2bmp", Version)
@@ -43,13 +49,16 @@ func main() {
 
 	flag.StringVar(&fontsFlag, "fonts", "", "Glob pattern (e.g. 'assets/*.ttf')")
 	flag.StringVar(&fontsFlag, "f", "", "Short for --fonts")
+	flag.StringVar(&familyFlag, "family", "", "Installed system font family (requires Fontconfig)")
+	flag.StringVar(&familyFlag, "font-family", "", "Alias for --family")
 	flag.StringVar(&sizesFlag, "sizes", "", "Comma sizes (e.g. '12,24')")
 	flag.StringVar(&sizesFlag, "s", "", "Short for --sizes")
 	flag.StringVar(&charsFlag, "chars", "", "Characters to include")
 	flag.StringVar(&charsFlag, "c", "", "Short for --chars")
+	flag.StringVar(&textFlag, "text", "", "Render one test string to BMP and report its pixel width")
 	flag.StringVar(&outDir, "out", ".", "Output dir")
 	flag.StringVar(&outDir, "o", ".", "Short for --out")
-	flag.StringVar(&typeFlag, "type", "png", "Output type: 'png' or 'bmp'")
+	flag.StringVar(&typeFlag, "type", "png", "Output type: 'png' or 'bmp' (image + fnt), or 'c' (C source + header, Microchip Graphics Library font format)")
 	flag.StringVar(&typeFlag, "t", "png", "Short for --type")
 	flag.IntVar(&paddingFlag, "padding", 2, "Padding between characters (pixels)")
 	flag.IntVar(&paddingFlag, "p", 2, "Short for --padding")
@@ -61,6 +70,13 @@ func main() {
 	flag.Float64Var(&strokeFlag, "stroke", 0, "Outline width in pixels, may be fractional; 0 draws filled glyphs")
 	flag.Float64Var(&strokeFlag, "w", 0, "Short for --stroke")
 
+	flag.IntVar(&bppFlag, "bpp", 0, "Bits per pixel: 1 (no antialiasing), 2, 4 or 8; default 8 for images, 1 for 'c'")
+	flag.IntVar(&bppFlag, "b", 0, "Short for --bpp")
+	flag.Float64Var(&thresholdFlag, "threshold", converter.DefaultThreshold, "Coverage (0-1] at which a pixel is on at 1 bpp")
+
+	flag.BoolVar(&tightFlag, "tight", false, "Crop the line height to the ink of the requested characters")
+	flag.StringVar(&nameFlag, "name", "", "Output base name instead of '<font>-<size>'; needs a single font and size")
+
 	flag.BoolVar(&showVersion, "version", false, "Print version")
 
 	flag.Parse()
@@ -70,29 +86,105 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := validateInputs(fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, paddingFlag, hintingFlag, strokeFlag)
+	if familyFlag != "" && fontsFlag != "" {
+		fmt.Println("Error: use either --family or --fonts, not both")
+		os.Exit(1)
+	}
+	fontInput := fontsFlag
+	if familyFlag != "" {
+		fontInput = familyFlag
+	}
+	if textFlag != "" {
+		if charsFlag != "" {
+			fmt.Println("Error: use either --text or --chars, not both")
+			os.Exit(1)
+		}
+		charsFlag = textFlag
+	}
+	cfg, err := validateInputs(fontInput, sizesFlag, charsFlag, outDir, typeFlag, paddingFlag, hintingFlag, strokeFlag, bppFlag, thresholdFlag)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		flag.Usage()
 		os.Exit(1)
 	}
-
-	// Glob / File detection
-	files, err := filepath.Glob(cfg.FontPattern)
-	if err != nil {
-		fmt.Printf("Glob error: %v\n", err)
+	cfg.Tight = tightFlag
+	cfg.Text = textFlag
+	if familyFlag != "" {
+		fontPath, err := resolveFontFamily(familyFlag)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.FontPattern = fontPath
+	}
+	if err := validateName(nameFlag, len(cfg.Sizes)); err != nil {
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	if len(files) == 0 {
-		if _, err := os.Stat(cfg.FontPattern); err == nil {
-			files = []string{cfg.FontPattern}
-		} else {
-			fmt.Printf("No fonts found for pattern: %s\n", cfg.FontPattern)
-			os.Exit(0)
+	cfg.Name = nameFlag
+
+	var files []string
+	if familyFlag != "" {
+		files = []string{cfg.FontPattern}
+	} else {
+		// Glob / File detection
+		files, err = filepath.Glob(cfg.FontPattern)
+		if err != nil {
+			fmt.Printf("Glob error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(files) == 0 {
+			if _, err := os.Stat(cfg.FontPattern); err == nil {
+				files = []string{cfg.FontPattern}
+			} else {
+				fmt.Printf("No fonts found for pattern: %s\n", cfg.FontPattern)
+				os.Exit(0)
+			}
 		}
 	}
 
+	if cfg.Name != "" && len(files) > 1 {
+		fmt.Printf("Error: --name needs a single font, but %q matches %d\n", cfg.FontPattern, len(files))
+		os.Exit(1)
+	}
+
+	if cfg.Text != "" {
+		if len(files) != 1 || len(cfg.Sizes) != 1 {
+			fmt.Println("Error: --text needs exactly one font and one size")
+			os.Exit(1)
+		}
+		if err := renderText(files[0], cfg); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	processBatch(files, cfg)
+}
+
+func renderText(fontPath string, cfg Config) error {
+	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+		return fmt.Errorf("creating output directory: %w", err)
+	}
+	base := strings.TrimSuffix(filepath.Base(fontPath), filepath.Ext(fontPath))
+	if cfg.Name != "" {
+		base = cfg.Name
+	}
+	size := cfg.Sizes[0]
+	outPath := filepath.Join(cfg.OutputDir, base+strokeSuffix(cfg.Stroke)+bppSuffix(cfg.BPP)+".bmp")
+	width, err := converter.RenderTextBMP(fontPath, size, cfg.Text, outPath, converter.Options{
+		Hinting:   cfg.Hinting,
+		Stroke:    cfg.Stroke,
+		BPP:       cfg.BPP,
+		Threshold: cfg.Threshold,
+		Tight:     cfg.Tight,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Wrote %s (%d px wide)\n", outPath, width)
+	return nil
 }
 
 func processBatch(files []string, cfg Config) {
@@ -121,13 +213,24 @@ func processBatch(files []string, cfg Config) {
 
 		for _, size := range cfg.Sizes {
 			currentJob++
-			outPrefix := filepath.Join(cfg.OutputDir, fmt.Sprintf("%s-%d%s", nameNoExt, size, strokeSuffix(cfg.Stroke)))
+			base := fmt.Sprintf("%s-%d", nameNoExt, size)
+			if cfg.Name != "" {
+				base = cfg.Name
+			}
+			outPrefix := filepath.Join(cfg.OutputDir, base+strokeSuffix(cfg.Stroke)+bppSuffix(cfg.BPP))
 
-			msg := fmt.Sprintf("Processing %s @ %dpx (pad:%d, hint:%s, stroke:%g)...", baseName, size, cfg.Padding, cfg.Hinting, cfg.Stroke)
+			msg := fmt.Sprintf("Processing %s @ %dpx (pad:%d, hint:%s, stroke:%g, bpp:%d)...", baseName, size, cfg.Padding, cfg.Hinting, cfg.Stroke, cfg.BPP)
 			updateUI(currentJob, totalJobs, msg)
 
-			// Pass Hinting
-			err := converter.Generate(fontPath, size, cfg.Chars, outPrefix, cfg.Format, cfg.Padding, cfg.Hinting, cfg.Stroke)
+			err := converter.GenerateWithOptions(fontPath, size, cfg.Chars, outPrefix, converter.Options{
+				Format:    cfg.Format,
+				Padding:   cfg.Padding,
+				Hinting:   cfg.Hinting,
+				Stroke:    cfg.Stroke,
+				BPP:       cfg.BPP,
+				Threshold: cfg.Threshold,
+				Tight:     cfg.Tight,
+			})
 
 			if err != nil {
 				errMsg := fmt.Sprintf("FAIL %s @ %dpx: %v", baseName, size, err)
@@ -152,14 +255,14 @@ func processBatch(files []string, cfg Config) {
 	}
 }
 
-func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, error) {
+func validateInputs(f, s, c, o, t string, p int, h string, w float64, b int, a float64) (Config, error) {
 	if f == "" || s == "" || c == "" {
 		return Config{}, fmt.Errorf("missing arguments")
 	}
 
 	t = strings.ToLower(t)
-	if t != "png" && t != "bmp" {
-		return Config{}, fmt.Errorf("invalid type: %s (must be 'png' or 'bmp')", t)
+	if t != "png" && t != "bmp" && t != "c" {
+		return Config{}, fmt.Errorf("invalid type: %s (must be 'png', 'bmp' or 'c')", t)
 	}
 
 	if p < 0 {
@@ -173,6 +276,20 @@ func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, e
 
 	if w != 0 && !(w >= converter.MinStroke && !math.IsInf(w, 0)) {
 		return Config{}, fmt.Errorf("invalid stroke: %v (must be 0 for filled glyphs, or at least %v pixels)", w, converter.MinStroke)
+	}
+
+	if b == 0 {
+		b = 8
+		if t == "c" {
+			b = 1
+		}
+	}
+	if !converter.ValidBPP(b) {
+		return Config{}, fmt.Errorf("invalid bpp: %d (use 1, 2, 4 or 8)", b)
+	}
+
+	if !converter.ValidThreshold(a) {
+		return Config{}, fmt.Errorf("invalid threshold: %v (must be above 0 and at most 1)", a)
 	}
 
 	var sizeInts []int
@@ -194,7 +311,24 @@ func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, e
 		Padding:     p,
 		Hinting:     h, // Set hinting
 		Stroke:      w,
+		BPP:         b,
+		Threshold:   a,
 	}, nil
+}
+
+// validateName checks a --name: it replaces '<font>-<size>' in the output file names,
+// so it names one output only and must be a plain file name.
+func validateName(name string, sizes int) error {
+	if name == "" {
+		return nil
+	}
+	if sizes > 1 {
+		return fmt.Errorf("--name needs a single size, got %d", sizes)
+	}
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid name: %q (must be a file name, not a path)", name)
+	}
+	return nil
 }
 
 // strokeSuffix names the output of a hollow font apart from the filled one of the same
@@ -206,6 +340,15 @@ func strokeSuffix(w float64) string {
 		return ""
 	}
 	return "-stroke" + strings.Replace(strconv.FormatFloat(w, 'f', -1, 64), ".", "p", 1)
+}
+
+// bppSuffix names output reduced from full 8-bit antialiasing apart from the full
+// one: "-1bpp", "-4bpp". At 8 bpp the name is unchanged.
+func bppSuffix(bpp int) string {
+	if bpp == 8 {
+		return ""
+	}
+	return fmt.Sprintf("-%dbpp", bpp)
 }
 
 func updateUI(current, total int, msg string) {
