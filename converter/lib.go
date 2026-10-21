@@ -31,6 +31,11 @@ type Options struct {
 	// Threshold is the coverage, above 0 and at most 1, at which a pixel is on at
 	// 1 bpp. It is ignored at other depths.
 	Threshold float64
+	// Tight crops the line height to the ink of the requested characters: the cell
+	// runs from the highest drawn row to the lowest, instead of the face's ascent,
+	// descent and line gap. Rows are counted after stroking and reducing to BPP, so a
+	// row that is not drawn at the final depth is not kept. Widths are unchanged.
+	Tight bool
 }
 
 // Generate creates the Font files (image + fnt) with full 8-bit antialiasing.
@@ -103,6 +108,12 @@ func GenerateWithOptions(fontPath string, size int, chars string, outPrefix stri
 	metrics := face.Metrics()
 	ascent := metrics.Ascent.Ceil()
 	lineHeight := metrics.Height.Ceil()
+	if opts.Tight {
+		if top, bottom, ok := inkExtent(face, chars); ok {
+			ascent = -top
+			lineHeight = bottom - top
+		}
+	}
 
 	var totalWidth int
 	var validCharCount int
@@ -164,6 +175,14 @@ func GenerateWithOptions(fontPath string, size int, chars string, outPrefix stri
 	// 5c. Reduce the antialiasing to the target depth
 	if err := quantize(img, opts.BPP, opts.Threshold); err != nil {
 		return err
+	}
+
+	// 5d. Drop the blank rows above and below the ink, if asked
+	if opts.Tight {
+		var removed int
+		img, removed = trimRows(img)
+		ascent -= removed
+		lineHeight = img.Bounds().Dy()
 	}
 
 	if format == "c" {
@@ -263,4 +282,55 @@ func GenerateWithOptions(fontPath string, size int, chars string, outPrefix stri
 	}
 
 	return nil
+}
+
+// inkExtent returns the whole-pixel rows, relative to the baseline (negative above it),
+// that the ink of chars spans: from top inclusive to bottom exclusive. ok is false when
+// none of chars has any ink, as for a string of spaces.
+func inkExtent(face font.Face, chars string) (top, bottom int, ok bool) {
+	for _, char := range chars {
+		ink, _, found := face.GlyphBounds(char)
+		if !found || ink.Empty() {
+			continue
+		}
+		t, b := ink.Min.Y.Floor(), ink.Max.Y.Ceil()
+		if !ok || t < top {
+			top = t
+		}
+		if !ok || b > bottom {
+			bottom = b
+		}
+		ok = true
+	}
+	return top, bottom, ok
+}
+
+// trimRows returns img without the fully transparent rows at its top and bottom, as a
+// new image with its origin at (0, 0), and how many rows it removed from the top. An
+// image with no ink at all is returned as it is.
+func trimRows(img *image.RGBA) (*image.RGBA, int) {
+	b := img.Bounds()
+	blank := func(y int) bool {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if img.Pix[img.PixOffset(x, y)+3] != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	top, bottom := b.Min.Y, b.Max.Y
+	for top < bottom && blank(top) {
+		top++
+	}
+	for bottom > top && blank(bottom-1) {
+		bottom--
+	}
+	if top == bottom {
+		return img, 0
+	}
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx(), bottom-top))
+	for y := top; y < bottom; y++ {
+		copy(out.Pix[out.PixOffset(0, y-top):], img.Pix[img.PixOffset(b.Min.X, y):img.PixOffset(b.Max.X, y)])
+	}
+	return out, top - b.Min.Y
 }

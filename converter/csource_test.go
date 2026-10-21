@@ -2,6 +2,7 @@ package converter
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/png"
 	"os"
@@ -342,5 +343,73 @@ func TestCharLabelNeverEndsInBackslash(t *testing.T) {
 				t.Errorf("charLabel(%#x) = %q ends in a backslash", r, l)
 			}
 		}
+	}
+}
+
+func TestTightCropsToInk(t *testing.T) {
+	fontPath := fontOrSkip(t)
+	for _, chars := range []string{"Ag|", "ace", "-", "_^"} {
+		full, tight := filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "x")
+		opts := Options{Format: "png", Padding: 2, Hinting: "full", BPP: 1, Threshold: DefaultThreshold}
+		if err := GenerateWithOptions(fontPath, 24, chars, full, opts); err != nil {
+			t.Fatal(err)
+		}
+		opts.Tight = true
+		if err := GenerateWithOptions(fontPath, 24, chars, tight, opts); err != nil {
+			t.Fatal(err)
+		}
+		a, b := alphaImage(t, full+".png"), alphaImage(t, tight+".png")
+		if a.Bounds().Dx() != b.Bounds().Dx() {
+			t.Fatalf("%q: tight changed the width: %d vs %d", chars, b.Bounds().Dx(), a.Bounds().Dx())
+		}
+		rowInk := func(img *image.Alpha, y int) bool {
+			for x := 0; x < img.Bounds().Dx(); x++ {
+				if img.AlphaAt(x, y).A != 0 {
+					return true
+				}
+			}
+			return false
+		}
+		h := b.Bounds().Dy()
+		if h == 0 || h >= a.Bounds().Dy() || !rowInk(b, 0) || !rowInk(b, h-1) {
+			t.Fatalf("%q: tight height %d of %d, ink in first/last row: %v/%v", chars, h, a.Bounds().Dy(), h > 0 && rowInk(b, 0), h > 0 && rowInk(b, h-1))
+		}
+		// The tight atlas must be a slice of the full one, which has blank rows only
+		// above and below it.
+		off := 0
+		for off < a.Bounds().Dy() && !rowInk(a, off) {
+			off++
+		}
+		for y := 0; y < a.Bounds().Dy(); y++ {
+			for x := 0; x < a.Bounds().Dx(); x++ {
+				want := uint8(0)
+				if y >= off && y < off+h {
+					want = b.AlphaAt(x, y-off).A
+				}
+				if got := a.AlphaAt(x, y).A; got != want {
+					t.Fatalf("%q: pixel (%d,%d) = %d in the full atlas, %d in the tight one", chars, x, y, got, want)
+				}
+			}
+		}
+		fnt, _ := os.ReadFile(tight + ".fnt")
+		if !bytes.Contains(fnt, []byte(fmt.Sprintf("lineHeight=%d ", h))) {
+			t.Errorf("%q: tight fnt does not give lineHeight=%d", chars, h)
+		}
+	}
+}
+
+func TestTightBlankCharsFallBack(t *testing.T) {
+	fontPath := fontOrSkip(t)
+	full, tight := filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "x")
+	opts := Options{Format: "png", Padding: 2, Hinting: "full", BPP: 8, Threshold: DefaultThreshold}
+	if err := GenerateWithOptions(fontPath, 24, "  ", full, opts); err != nil {
+		t.Fatal(err)
+	}
+	opts.Tight = true
+	if err := GenerateWithOptions(fontPath, 24, "  ", tight, opts); err != nil {
+		t.Fatal(err)
+	}
+	if alphaImage(t, full+".png").Bounds() != alphaImage(t, tight+".png").Bounds() {
+		t.Error("tight on blank characters should keep the face's line height")
 	}
 }

@@ -62,3 +62,22 @@ func TestValidateBPP(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateName(t *testing.T) {
+	for _, n := range []string{"", "Bitmap6px", "a-b_c.d"} {
+		if err := validateName(n, 1); err != nil {
+			t.Errorf("name %q: %v", n, err)
+		}
+	}
+	for _, n := range []string{"a/b", `a\b`, ".", ".."} {
+		if validateName(n, 1) == nil {
+			t.Errorf("name %q: accepted, want an error", n)
+		}
+	}
+	if validateName("x", 2) == nil {
+		t.Error("name with two sizes: accepted, want an error")
+	}
+	if validateName("", 2) != nil {
+		t.Error("no name with two sizes: rejected")
+	}
+}

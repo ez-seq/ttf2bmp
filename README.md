@@ -87,6 +87,8 @@ Instead, use the `--fonts` flag to provide a file path or a glob pattern to sele
 | `--stroke` | `-w` | Outline width in pixels, at least `0.125`; `0` draws filled glyphs | No (Default: `0`) | `1.25` |
 | `--bpp`   | `-b`  | Bits per pixel: `1` (no antialiasing), `2`, `4` or `8` | No (Default: `8`; `1` for `--type c`) | `4` |
 | `--threshold` |   | Coverage in (0, 1] at which a pixel is on, at 1 bpp only | No (Default: `0.5`) | `0.4` |
+| `--tight` |       | Crop the line height to the ink of the requested characters | No | |
+| `--name`  |       | Output base name instead of `<font>-<size>`; one font and one size only | No | `Small6px` |
 
 ### Example
 
@@ -127,6 +129,25 @@ interior, so the glyph is drawn as an outline:
 * **Reduced fonts get their own file names**, with a suffix, so they can share a directory with the full ones:
   `Face-12.png`, `Face-12-1bpp.png`, `Face-12-4bpp.png`.
 * **Without `--bpp`, image output is unchanged**, byte for byte.
+
+### Tight line height
+
+`--tight` crops the line height to the ink of the requested characters, instead of the face's ascent, descent and line
+gap. It crops the one cell all glyphs share, not each glyph: every glyph keeps the same baseline, and the cell runs from
+the highest ink of any character to the lowest. Only rows that are blank in every glyph are removed, so the glyphs stay
+aligned, and the `.fnt` (`lineHeight`, `base`) or the C header (`height`) give the cropped height.
+
+This suits pixel fonts, whose declared line metrics often add blank rows, and embedded targets, where the cell height is
+the font height. Rows are counted at the final depth, so with `--bpp 1` a row of faint antialiasing that does not reach
+the threshold is not kept.
+
+### Pixel fonts in TrueType outlines
+
+Pixel fonts are often distributed as TrueType files in which every pixel is a square outline. These render exactly, with
+no antialiasing, at the size where one design pixel is one output pixel: `--sizes` is pixels per em, so for a font with
+1024 units per em and 64-unit pixels, that is `-s 16`, whatever size the font's name gives. `--tight` then crops the cell
+to the pixels in use. [`scripts/render-revnew-fonts.sh`](scripts/render-revnew-fonts.sh) renders a set of such fonts this
+way, as both BMP and C source.
 
 ### Embedded C source
 
@@ -169,6 +190,8 @@ The project is organized into a modular structure separating the CLI, the core l
 /ttf2bmp
   ├── main.go                # Main CLI entry point (Batch Processor & UI)
   ├── main_test.go           # CLI option tests
+  ├── scripts/
+  │   └── render-revnew-fonts.sh  # Renders fonts-ttf/RevNewFonts to BMP and C
   ├── converter/             # Core Library
   |   ├── bmp.go             # BMP image generation logic
   │   ├── csource.go         # Embedded C source output (--type c)

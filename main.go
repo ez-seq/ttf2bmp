@@ -28,6 +28,8 @@ type Config struct {
 	Stroke      float64
 	BPP         int
 	Threshold   float64
+	Tight       bool
+	Name        string
 }
 
 var logBuffer []string
@@ -36,7 +38,8 @@ func main() {
 	var fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, hintingFlag string
 	var paddingFlag, bppFlag int
 	var strokeFlag, thresholdFlag float64
-	var showVersion bool
+	var showVersion, tightFlag bool
+	var nameFlag string
 
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s (%s):\n", "ttf2bmp", Version)
@@ -67,6 +70,9 @@ func main() {
 	flag.IntVar(&bppFlag, "b", 0, "Short for --bpp")
 	flag.Float64Var(&thresholdFlag, "threshold", converter.DefaultThreshold, "Coverage (0-1] at which a pixel is on at 1 bpp")
 
+	flag.BoolVar(&tightFlag, "tight", false, "Crop the line height to the ink of the requested characters")
+	flag.StringVar(&nameFlag, "name", "", "Output base name instead of '<font>-<size>'; needs a single font and size")
+
 	flag.BoolVar(&showVersion, "version", false, "Print version")
 
 	flag.Parse()
@@ -82,6 +88,12 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	cfg.Tight = tightFlag
+	if err := validateName(nameFlag, len(cfg.Sizes)); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.Name = nameFlag
 
 	// Glob / File detection
 	files, err := filepath.Glob(cfg.FontPattern)
@@ -96,6 +108,11 @@ func main() {
 			fmt.Printf("No fonts found for pattern: %s\n", cfg.FontPattern)
 			os.Exit(0)
 		}
+	}
+
+	if cfg.Name != "" && len(files) > 1 {
+		fmt.Printf("Error: --name needs a single font, but %q matches %d\n", cfg.FontPattern, len(files))
+		os.Exit(1)
 	}
 
 	processBatch(files, cfg)
@@ -127,7 +144,11 @@ func processBatch(files []string, cfg Config) {
 
 		for _, size := range cfg.Sizes {
 			currentJob++
-			outPrefix := filepath.Join(cfg.OutputDir, fmt.Sprintf("%s-%d%s%s", nameNoExt, size, strokeSuffix(cfg.Stroke), bppSuffix(cfg.BPP)))
+			base := fmt.Sprintf("%s-%d", nameNoExt, size)
+			if cfg.Name != "" {
+				base = cfg.Name
+			}
+			outPrefix := filepath.Join(cfg.OutputDir, base+strokeSuffix(cfg.Stroke)+bppSuffix(cfg.BPP))
 
 			msg := fmt.Sprintf("Processing %s @ %dpx (pad:%d, hint:%s, stroke:%g, bpp:%d)...", baseName, size, cfg.Padding, cfg.Hinting, cfg.Stroke, cfg.BPP)
 			updateUI(currentJob, totalJobs, msg)
@@ -139,6 +160,7 @@ func processBatch(files []string, cfg Config) {
 				Stroke:    cfg.Stroke,
 				BPP:       cfg.BPP,
 				Threshold: cfg.Threshold,
+				Tight:     cfg.Tight,
 			})
 
 			if err != nil {
@@ -223,6 +245,21 @@ func validateInputs(f, s, c, o, t string, p int, h string, w float64, b int, a f
 		BPP:         b,
 		Threshold:   a,
 	}, nil
+}
+
+// validateName checks a --name: it replaces '<font>-<size>' in the output file names,
+// so it names one output only and must be a plain file name.
+func validateName(name string, sizes int) error {
+	if name == "" {
+		return nil
+	}
+	if sizes > 1 {
+		return fmt.Errorf("--name needs a single size, got %d", sizes)
+	}
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid name: %q (must be a file name, not a path)", name)
+	}
+	return nil
 }
 
 // strokeSuffix names the output of a hollow font apart from the filled one of the same
