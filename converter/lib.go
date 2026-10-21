@@ -12,14 +12,55 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
-// Generate creates the Font files (image + fnt).
-// Now accepts 'hinting' ("none", "vertical", "full")
+// Options controls how a font is rendered and written.
+type Options struct {
+	// Format is "png" or "bmp" (image + fnt), or "c" (C source + header in the
+	// Microchip Graphics Library font format).
+	Format string
+	// Padding is the gap between glyphs in the atlas, in pixels.
+	Padding int
+	// Hinting is "none", "vertical" or "full".
+	Hinting string
+	// Stroke is 0 for filled glyphs; a positive width in pixels, which may be
+	// fractional, keeps only the band that far inside each glyph's edge (hollow
+	// glyphs). It changes the image only; the fnt is the same as for filled glyphs.
+	Stroke float64
+	// BPP is the colour depth, 1, 2, 4 or 8 bits per pixel: the number of
+	// antialiasing levels is 2^BPP, so 1 turns antialiasing off.
+	BPP int
+	// Threshold is the coverage, above 0 and at most 1, at which a pixel is on at
+	// 1 bpp. It is ignored at other depths.
+	Threshold float64
+}
+
+// Generate creates the Font files (image + fnt) with full 8-bit antialiasing.
+// It accepts 'hinting' ("none", "vertical", "full")
 // and 'stroke': 0 draws filled glyphs; a positive width in pixels, which may be
 // fractional, keeps only the band that far inside each glyph's edge (hollow glyphs).
 // The stroke changes the image only; the fnt is the same as for filled glyphs.
-func Generate(fontPath string, size int, chars string, outPrefix string, format string, padding int, hinting string, stroke float64) (err error) {
+func Generate(fontPath string, size int, chars string, outPrefix string, format string, padding int, hinting string, stroke float64) error {
+	return GenerateWithOptions(fontPath, size, chars, outPrefix, Options{
+		Format:    format,
+		Padding:   padding,
+		Hinting:   hinting,
+		Stroke:    stroke,
+		BPP:       8,
+		Threshold: DefaultThreshold,
+	})
+}
+
+// GenerateWithOptions creates the font files for one face and size: an image and an
+// fnt descriptor, or for Format "c" a C source and header for an embedded target.
+func GenerateWithOptions(fontPath string, size int, chars string, outPrefix string, opts Options) (err error) {
+	format, padding, hinting, stroke := opts.Format, opts.Padding, opts.Hinting, opts.Stroke
 	if stroke != 0 && !(stroke >= MinStroke) {
 		return fmt.Errorf("stroke %v: must be 0 (filled) or at least %v px", stroke, MinStroke)
+	}
+	if !ValidBPP(opts.BPP) {
+		return fmt.Errorf("bpp %d: must be 1, 2, 4 or 8", opts.BPP)
+	}
+	if opts.BPP == 1 && !ValidThreshold(opts.Threshold) {
+		return fmt.Errorf("threshold %v: must be above 0 and at most 1", opts.Threshold)
 	}
 
 	// 1. Read & Parse Font
@@ -120,6 +161,29 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 		}
 	}
 
+	// 5c. Reduce the antialiasing to the target depth
+	if err := quantize(img, opts.BPP, opts.Threshold); err != nil {
+		return err
+	}
+
+	if format == "c" {
+		glyphs := make(map[rune]cGlyph, len(charPositions))
+		for char, x := range charPositions {
+			_, advance, _ := face.GlyphBounds(char)
+			glyphs[char] = cGlyph{x: x, width: advance.Ceil()}
+		}
+		return writeCSource(outPrefix, img, cFont{
+			fontPath:  fontPath,
+			size:      size,
+			hinting:   hinting,
+			stroke:    stroke,
+			bpp:       opts.BPP,
+			threshold: opts.Threshold,
+			height:    lineHeight,
+			glyphs:    glyphs,
+		})
+	}
+
 	// 6. Save Image
 	ext := "." + format
 	if err := func() error {
@@ -163,7 +227,11 @@ func Generate(fontPath string, size int, chars string, outPrefix string, format 
 
 		fileName := filepath.Base(outPrefix) + ext
 
-		if _, err := fmt.Fprintf(fntFile, "info face=\"%s\" size=%d bold=0 italic=0 charset=\"\" unicode=0 stretchH=100 smooth=1 aa=1 padding=0,0,0,0 spacing=%d,1\n", filepath.Base(fontPath), size, padding); err != nil {
+		smooth := 1
+		if opts.BPP == 1 {
+			smooth = 0
+		}
+		if _, err := fmt.Fprintf(fntFile, "info face=\"%s\" size=%d bold=0 italic=0 charset=\"\" unicode=0 stretchH=100 smooth=%d aa=1 padding=0,0,0,0 spacing=%d,1\n", filepath.Base(fontPath), size, smooth, padding); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintf(fntFile, "common lineHeight=%d base=%d scaleW=%d scaleH=%d pages=1 packed=0\n", lineHeight, ascent, totalWidth, lineHeight); err != nil {

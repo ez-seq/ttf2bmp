@@ -26,14 +26,16 @@ type Config struct {
 	Padding     int
 	Hinting     string // New field
 	Stroke      float64
+	BPP         int
+	Threshold   float64
 }
 
 var logBuffer []string
 
 func main() {
 	var fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, hintingFlag string
-	var paddingFlag int
-	var strokeFlag float64
+	var paddingFlag, bppFlag int
+	var strokeFlag, thresholdFlag float64
 	var showVersion bool
 
 	flag.Usage = func() {
@@ -49,7 +51,7 @@ func main() {
 	flag.StringVar(&charsFlag, "c", "", "Short for --chars")
 	flag.StringVar(&outDir, "out", ".", "Output dir")
 	flag.StringVar(&outDir, "o", ".", "Short for --out")
-	flag.StringVar(&typeFlag, "type", "png", "Output type: 'png' or 'bmp'")
+	flag.StringVar(&typeFlag, "type", "png", "Output type: 'png' or 'bmp' (image + fnt), or 'c' (C source + header, Microchip Graphics Library font format)")
 	flag.StringVar(&typeFlag, "t", "png", "Short for --type")
 	flag.IntVar(&paddingFlag, "padding", 2, "Padding between characters (pixels)")
 	flag.IntVar(&paddingFlag, "p", 2, "Short for --padding")
@@ -61,6 +63,10 @@ func main() {
 	flag.Float64Var(&strokeFlag, "stroke", 0, "Outline width in pixels, may be fractional; 0 draws filled glyphs")
 	flag.Float64Var(&strokeFlag, "w", 0, "Short for --stroke")
 
+	flag.IntVar(&bppFlag, "bpp", 0, "Bits per pixel: 1 (no antialiasing), 2, 4 or 8; default 8 for images, 1 for 'c'")
+	flag.IntVar(&bppFlag, "b", 0, "Short for --bpp")
+	flag.Float64Var(&thresholdFlag, "threshold", converter.DefaultThreshold, "Coverage (0-1] at which a pixel is on at 1 bpp")
+
 	flag.BoolVar(&showVersion, "version", false, "Print version")
 
 	flag.Parse()
@@ -70,7 +76,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := validateInputs(fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, paddingFlag, hintingFlag, strokeFlag)
+	cfg, err := validateInputs(fontsFlag, sizesFlag, charsFlag, outDir, typeFlag, paddingFlag, hintingFlag, strokeFlag, bppFlag, thresholdFlag)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		flag.Usage()
@@ -121,13 +127,19 @@ func processBatch(files []string, cfg Config) {
 
 		for _, size := range cfg.Sizes {
 			currentJob++
-			outPrefix := filepath.Join(cfg.OutputDir, fmt.Sprintf("%s-%d%s", nameNoExt, size, strokeSuffix(cfg.Stroke)))
+			outPrefix := filepath.Join(cfg.OutputDir, fmt.Sprintf("%s-%d%s%s", nameNoExt, size, strokeSuffix(cfg.Stroke), bppSuffix(cfg.BPP)))
 
-			msg := fmt.Sprintf("Processing %s @ %dpx (pad:%d, hint:%s, stroke:%g)...", baseName, size, cfg.Padding, cfg.Hinting, cfg.Stroke)
+			msg := fmt.Sprintf("Processing %s @ %dpx (pad:%d, hint:%s, stroke:%g, bpp:%d)...", baseName, size, cfg.Padding, cfg.Hinting, cfg.Stroke, cfg.BPP)
 			updateUI(currentJob, totalJobs, msg)
 
-			// Pass Hinting
-			err := converter.Generate(fontPath, size, cfg.Chars, outPrefix, cfg.Format, cfg.Padding, cfg.Hinting, cfg.Stroke)
+			err := converter.GenerateWithOptions(fontPath, size, cfg.Chars, outPrefix, converter.Options{
+				Format:    cfg.Format,
+				Padding:   cfg.Padding,
+				Hinting:   cfg.Hinting,
+				Stroke:    cfg.Stroke,
+				BPP:       cfg.BPP,
+				Threshold: cfg.Threshold,
+			})
 
 			if err != nil {
 				errMsg := fmt.Sprintf("FAIL %s @ %dpx: %v", baseName, size, err)
@@ -152,14 +164,14 @@ func processBatch(files []string, cfg Config) {
 	}
 }
 
-func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, error) {
+func validateInputs(f, s, c, o, t string, p int, h string, w float64, b int, a float64) (Config, error) {
 	if f == "" || s == "" || c == "" {
 		return Config{}, fmt.Errorf("missing arguments")
 	}
 
 	t = strings.ToLower(t)
-	if t != "png" && t != "bmp" {
-		return Config{}, fmt.Errorf("invalid type: %s (must be 'png' or 'bmp')", t)
+	if t != "png" && t != "bmp" && t != "c" {
+		return Config{}, fmt.Errorf("invalid type: %s (must be 'png', 'bmp' or 'c')", t)
 	}
 
 	if p < 0 {
@@ -173,6 +185,20 @@ func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, e
 
 	if w != 0 && !(w >= converter.MinStroke && !math.IsInf(w, 0)) {
 		return Config{}, fmt.Errorf("invalid stroke: %v (must be 0 for filled glyphs, or at least %v pixels)", w, converter.MinStroke)
+	}
+
+	if b == 0 {
+		b = 8
+		if t == "c" {
+			b = 1
+		}
+	}
+	if !converter.ValidBPP(b) {
+		return Config{}, fmt.Errorf("invalid bpp: %d (use 1, 2, 4 or 8)", b)
+	}
+
+	if !converter.ValidThreshold(a) {
+		return Config{}, fmt.Errorf("invalid threshold: %v (must be above 0 and at most 1)", a)
 	}
 
 	var sizeInts []int
@@ -194,6 +220,8 @@ func validateInputs(f, s, c, o, t string, p int, h string, w float64) (Config, e
 		Padding:     p,
 		Hinting:     h, // Set hinting
 		Stroke:      w,
+		BPP:         b,
+		Threshold:   a,
 	}, nil
 }
 
@@ -206,6 +234,15 @@ func strokeSuffix(w float64) string {
 		return ""
 	}
 	return "-stroke" + strings.Replace(strconv.FormatFloat(w, 'f', -1, 64), ".", "p", 1)
+}
+
+// bppSuffix names output reduced from full 8-bit antialiasing apart from the full
+// one: "-1bpp", "-4bpp". At 8 bpp the name is unchanged.
+func bppSuffix(bpp int) string {
+	if bpp == 8 {
+		return ""
+	}
+	return fmt.Sprintf("-%dbpp", bpp)
 }
 
 func updateUI(current, total int, msg string) {

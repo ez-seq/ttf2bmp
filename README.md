@@ -17,6 +17,10 @@ and automated regression testing.
 * **Smart Dashboard**: A rolling command-line UI providing real-time progress bars and log windows without cluttering
   the terminal.
 * **Hollow Glyphs**: Optionally keeps only an outline of each glyph, with a fractional, antialiased stroke width.
+* **Antialiasing Control**: Renders at 1, 2, 4 or 8 bits per pixel; 1 bit turns antialiasing off, for monochrome
+  screens, with an adjustable coverage threshold.
+* **Embedded C Output**: Writes fonts as C source in the Microchip Graphics Library font format, ready to compile
+  into flash.
 * **Verification Suite**: Includes built-in tools for visual inspection and pixel-perfect regression testing against the
   original TTF.
 * **Cross-Platform**: Compiles for Linux, Windows, and macOS (Intel/Apple Silicon) with zero dependencies.
@@ -78,7 +82,11 @@ Instead, use the `--fonts` flag to provide a file path or a glob pattern to sele
 | `--sizes` | `-s`  | Comma-separated list of sizes   | Yes               | `"16, 24, 32"`   |
 | `--chars` | `-c`  | String of characters to include | Yes               | `"ABCabc123"`    |
 | `--out`   | `-o`  | Output directory                | No (Default: `.`) | `build/fonts`    |
+| `--type`  | `-t`  | Output type: `png` or `bmp` (image + `.fnt`), or `c` (C source + header) | No (Default: `png`) | `c` |
+| `--hinting` | `-h` | Hinting: `none`, `vertical` or `full` | No (Default: `full`) | `none` |
 | `--stroke` | `-w` | Outline width in pixels, at least `0.125`; `0` draws filled glyphs | No (Default: `0`) | `1.25` |
+| `--bpp`   | `-b`  | Bits per pixel: `1` (no antialiasing), `2`, `4` or `8` | No (Default: `8`; `1` for `--type c`) | `4` |
+| `--threshold` |   | Coverage in (0, 1] at which a pixel is on, at 1 bpp only | No (Default: `0.5`) | `0.4` |
 
 ### Example
 
@@ -107,6 +115,52 @@ interior, so the glyph is drawn as an outline:
 ./bin/ttf2bmp -f "assets/fonts/Face.ttf" -s "54,68" -c "0123456789:" --stroke 1.25 -o output/
 ```
 
+### Antialiasing
+
+`--bpp N` reduces each pixel's coverage to `2^N` levels: `8` is the full antialiasing the rasteriser produces, `4` and
+`2` are 16 and 4 grey levels for grayscale screens, and `1` turns antialiasing off for monochrome screens.
+
+* **At 1 bpp a pixel is on when its coverage reaches `--threshold`** (default `0.5`). Lower it to thicken thin
+  strokes, raise it to thin heavy ones. `--hinting full` (the default) usually gives the crispest 1-bit result.
+* **The image shows exactly what the screen will**: PNG and BMP output is quantized to the same levels, rescaled to
+  0-255, and a 1 bpp `.fnt` says `smooth=0`.
+* **Reduced fonts get their own file names**, with a suffix, so they can share a directory with the full ones:
+  `Face-12.png`, `Face-12-1bpp.png`, `Face-12-4bpp.png`.
+* **Without `--bpp`, image output is unchanged**, byte for byte.
+
+### Embedded C source
+
+`--type c` writes the font as a pair of C files for an embedded target, instead of an image and a `.fnt`. They use the font
+format of the [Microchip Graphics Library](https://www.microchip.com/en-us/tools-resources/develop/libraries/microchip-libraries-applications)
+(MLA): the font tables declared in its `Primitive.h` and written by Microchip's Graphics Resource Converter, and read
+by its text routines and the many display drivers derived from it.
+
+```bash
+./bin/ttf2bmp -f "assets/fonts/Face.ttf" -s 12 -t c -c " !\"#\$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\`abcdefghijklmnopqrstuvwxyz{|}~" -o fonts/
+# Output: fonts/Face-12-1bpp.c, fonts/Face-12-1bpp.h
+```
+
+* **The layout is the one the library's `SetFont`, `OutChar` and `GetTextWidth` read**: a `FONT_HEADER`, a
+  `GLYPH_ENTRY` table and the glyph bitmaps, in one `const` struct, so the font lives in flash and needs no
+  decompression or init call. The struct is declared with the target's own types from `Primitive.h`, so the
+  compiler lays out the bit fields, and `_Static_assert`s (C11) check that the glyph offsets match the layout.
+* **The header exports one opaque handle**, named after the file: `extern void * gpOpaqueFont_Face_12_1bpp;`. Add the
+  `.c` to the build and select it with `SetFont(gpOpaqueFont_Face_12_1bpp);`. The handle points to an `SFontHandle`,
+  which `Primitive.h` must declare as a struct holding only the font's address:
+  `typedef struct { const char * address; } SFontHandle;`. This differs from MLA's own `FONT_FLASH`, which carries a
+  memory type before the address.
+* **Glyphs are cells of the advance width and the full line height**, as in the atlas, with the baseline at the
+  ascent. Each row is `ceil(width * bpp / 8)` bytes, pixels packed from the least significant bit, which is the
+  leftmost pixel, as in MLA. Every row carries a comment drawing it, so a glyph can be reviewed in the source.
+* **The font covers one contiguous range**, from the lowest to the highest character in `--chars`. Characters in
+  between that were not asked for, or that the face lacks, get an empty glyph of width 0. Codes above `0xFF` are
+  refused, since renderers derived from MLA commonly index glyphs by `unsigned char`; widths are limited to 255
+  pixels, the size of the `GLYPH_ENTRY` width field.
+* **The default depth is 1 bpp.** `--bpp 2`, `4` or `8` sets `FONT_HEADER.bpp` to match (its value is the exponent:
+  `0`-`3` for 1, 2, 4 and 8 bpp), for a grayscale screen; the target's renderer must then draw that depth. MLA draws
+  1 bpp fonts, and antialiased ones only when built with its antialiasing option; many derived renderers draw 1 bpp
+  only.
+
 ## Project structure
 
 The project is organized into a modular structure separating the CLI, the core library, and the verification tools.
@@ -117,8 +171,11 @@ The project is organized into a modular structure separating the CLI, the core l
   ├── main_test.go           # CLI option tests
   ├── converter/             # Core Library
   |   ├── bmp.go             # BMP image generation logic
+  │   ├── csource.go         # Embedded C source output (--type c)
+  │   ├── csource_test.go    # C output, antialiasing and threshold tests
   │   ├── lib.go             # Font rendering & FNT generation logic
   │   ├── lib_test.go        # Unit tests & Benchmarks
+  │   ├── quantize.go        # Antialiasing depth (--bpp, --threshold)
   │   ├── stroke.go          # Hollow glyphs (--stroke)
   │   └── stroke_test.go     # Stroke and distance transform tests
   ├── go.mod                 # Dependency Management
